@@ -2,6 +2,7 @@ import os
 import time
 import docker
 import psutil
+import asyncio
 import threading
 
 from telegram import Update
@@ -12,104 +13,187 @@ CHAT_ID = int(os.getenv("CHAT_ID"))
 
 CPU_LIMIT = 80
 RAM_LIMIT = 90
+DISK_LIMIT = 90
+
+CHECK_INTERVAL = 300
 
 XRAY_CONTAINER = "xray-proxy"
 AMNEZIA_CONTAINER = "amnezia-xray"
 
 client = docker.from_env()
 
+ALERTS = {
+"cpu": False,
+"ram": False,
+"disk": False,
+"xray": False,
+"amnezia": False,
+}
+
+async def send_alert(app, text):
+await app.bot.send_message(
+chat_id=CHAT_ID,
+text=text
+)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+cpu = psutil.cpu_percent()
+ram = psutil.virtual_memory().percent
+disk = psutil.disk_usage("/").percent
+
+```
+text = (
+    f"🖥 Сервер\n\n"
+    f"CPU: {cpu}%\n"
+    f"RAM: {ram}%\n"
+    f"DISK: {disk}%"
+)
+
+await update.message.reply_text(text)
+```
+
+async def docker_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+containers = client.containers.list(all=True)
+
+```
+text = "🐳 Docker контейнеры:\n\n"
+
+for c in containers:
+    text += f"{c.name}: {c.status}\n"
+
+await update.message.reply_text(text)
+```
+
+async def xray_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+text = "📡 Xray / Amnezia\n\n"
+
+```
+for name in [XRAY_CONTAINER, AMNEZIA_CONTAINER]:
+    try:
+        container = client.containers.get(name)
+        container.reload()
+        text += f"{name}: {container.status}\n"
+    except:
+        text += f"{name}: not found\n"
+
+await update.message.reply_text(text)
+```
+
+async def restart_xray(update: Update, context: ContextTypes.DEFAULT_TYPE):
+try:
+client.containers.get(XRAY_CONTAINER).restart()
+client.containers.get(AMNEZIA_CONTAINER).restart()
+
+```
+    await update.message.reply_text(
+        "✅ Xray и Amnezia перезапущены"
+    )
+
+except Exception as e:
+    await update.message.reply_text(str(e))
+```
+
+def monitor(app):
+
+```
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+while True:
+
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory().percent
     disk = psutil.disk_usage("/").percent
 
-    text = (
-        f"🖥 CPU: {cpu}%\n"
-        f"💾 RAM: {ram}%\n"
-        f"📀 Disk: {disk}%"
-    )
+    if cpu > CPU_LIMIT and not ALERTS["cpu"]:
+        loop.run_until_complete(
+            send_alert(app, f"🚨 CPU высокая нагрузка: {cpu}%")
+        )
+        ALERTS["cpu"] = True
 
-    await update.message.reply_text(text)
+    elif cpu <= CPU_LIMIT:
+        ALERTS["cpu"] = False
 
+    if ram > RAM_LIMIT and not ALERTS["ram"]:
+        loop.run_until_complete(
+            send_alert(app, f"🚨 RAM высокая нагрузка: {ram}%")
+        )
+        ALERTS["ram"] = True
 
-async def docker_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    containers = client.containers.list(all=True)
+    elif ram <= RAM_LIMIT:
+        ALERTS["ram"] = False
 
-    text = "🐳 Docker:\n\n"
+    if disk > DISK_LIMIT and not ALERTS["disk"]:
+        loop.run_until_complete(
+            send_alert(app, f"🚨 DISK заполнен: {disk}%")
+        )
+        ALERTS["disk"] = True
 
-    for c in containers:
-        text += f"{c.name} : {c.status}\n"
+    elif disk <= DISK_LIMIT:
+        ALERTS["disk"] = False
 
-    await update.message.reply_text(text)
+    for name, key in [
+        (XRAY_CONTAINER, "xray"),
+        (AMNEZIA_CONTAINER, "amnezia")
+    ]:
 
-
-async def xray_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = ""
-
-    for name in [XRAY_CONTAINER, AMNEZIA_CONTAINER]:
         try:
+
             container = client.containers.get(name)
-            text += f"{name}: {container.status}\n"
-        except:
-            text += f"{name}: not found\n"
+            container.reload()
 
-    await update.message.reply_text(text)
+            if container.status != "running":
 
+                if not ALERTS[key]:
 
-def monitor(app):
-    while True:
-
-        cpu = psutil.cpu_percent()
-        ram = psutil.virtual_memory().percent
-
-        if cpu > CPU_LIMIT:
-            app.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"⚠ CPU usage {cpu}%"
-            )
-
-        if ram > RAM_LIMIT:
-            app.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"⚠ RAM usage {ram}%"
-            )
-
-        for name in [XRAY_CONTAINER, AMNEZIA_CONTAINER]:
-            try:
-                container = client.containers.get(name)
-
-                if container.status != "running":
-                    app.bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=f"🚨 Container {name} stopped"
+                    loop.run_until_complete(
+                        send_alert(
+                            app,
+                            f"❌ Контейнер {name} остановлен"
+                        )
                     )
 
-            except:
-                app.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🚨 Container {name} not found"
+                    ALERTS[key] = True
+
+            else:
+                ALERTS[key] = False
+
+        except:
+
+            if not ALERTS[key]:
+
+                loop.run_until_complete(
+                    send_alert(
+                        app,
+                        f"❌ Контейнер {name} не найден"
+                    )
                 )
 
-        time.sleep(300)
+                ALERTS[key] = True
 
+    time.sleep(CHECK_INTERVAL)
+```
 
 def main():
 
-    app = ApplicationBuilder().token(TOKEN).build()
+```
+app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("docker", docker_status))
-    app.add_handler(CommandHandler("xray", xray_status))
+app.add_handler(CommandHandler("status", status))
+app.add_handler(CommandHandler("docker", docker_status))
+app.add_handler(CommandHandler("xray", xray_status))
+app.add_handler(CommandHandler("restartxray", restart_xray))
 
-    threading.Thread(
-        target=monitor,
-        args=(app,),
-        daemon=True
-    ).start()
+threading.Thread(
+    target=monitor,
+    args=(app,),
+    daemon=True
+).start()
 
-    app.run_polling()
+print("Server Monitor Bot started")
 
+app.run_polling()
+```
 
-if __name__ == "__main__":
-    main()
+if **name** == "**main**":
+main()
