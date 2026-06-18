@@ -1,4 +1,5 @@
 python-telegram-bot
 psutil
-python-dotenv
 docker
+requests
+python-dotenv
